@@ -2,6 +2,7 @@
 # define VPP_IMAGENd_HPP__
 
 # include <iostream>
+# include <algorithm>
 # include <iod/sio.hh>
 # include <vpp/core/imageNd.hh>
 # include <vpp/core/boxNd.hh>
@@ -110,30 +111,10 @@ namespace vpp
       "You must provide the pitch (Number of bits between the begining of to successive lines when providing a data pointer the image constructor.");
 
     if (options.has(_data))
-    {
-      ptr_ = std::shared_ptr<imageNd_data<V, N>>(new imageNd_data<V, N>());
-
-      ptr_->data_ = (V*) options.get(_data, (V*)0);
-      ptr_->begin_ = ptr_->data_;
-      ptr_->pitch_ = options.get(_pitch, 0);
-      ptr_->domain_ = domain;
-      ptr_->buffer_domain_ = domain;
-      ptr_->border_ = options.get(_border, 0);
-
-      // compute alignement.
-      unsigned int data_al = 1;
-      typedef unsigned long UL;
-      while ((UL(ptr_->data_) % (data_al * 2)) == 0) data_al *= 2;
-      unsigned int pitch_al = 1;
-      while ((UL(ptr_->pitch_) % (pitch_al * 2)) == 0) pitch_al *= 2;
-      ptr_->alignment_ = std::min(data_al, pitch_al);
-
-      int size = ptr_->pitch_;
-      for (int n = 0; n < N - 1; n++)
-        size *= ptr_->domain_.size(n);
-
-      ptr_->data_end_ = (V*)((char*) ptr_->data_ + size);
-    }
+      adapt_external_data(domain,
+                          (V*) options.get(_data, (V*)0),
+                          options.get(_pitch, 0),
+                          options.get(_border, 0));
     else
       allocate(dims, options);
 
@@ -188,14 +169,66 @@ namespace vpp
     for (unsigned i = 0; i < N; i++)
       p2[i] = dims[i] - 1;
     d.domain_ = boxNd<N, int>(vint<N>::Zero(), p2);
+    // The buffer holds the border ring around the domain: the slice
+    // strides used by coords_to_offset() must match the allocation
+    // layout computed above (dims[i] + 2 * border rows per slice).
+    d.buffer_domain_ = d.domain_ + vpp::border(d.border_);
 
     // Set begin_, the address of the first pixel.
     vint<N> p = vint<N>::Ones() * d.border_;
     d.begin_ = (V*)((char*)d.data_ + border_padding + coords_to_offset(p));
-    d.buffer_domain_ = d.domain_;
   }
 
-  
+  template <typename V, unsigned N>
+  void imageNd<V, N>::adapt_external_data(const boxNd<N>& domain, V* data, int pitch, int border)
+  {
+    ptr_ = std::shared_ptr<imageNd_data<V, N>>(new imageNd_data<V, N>());
+    auto& d = *ptr_;
+
+    d.begin_ = data; // Address of the pixel at domain().p1().
+    d.pitch_ = pitch; // Signed byte distance between two consecutive rows.
+    d.domain_ = domain;
+    d.buffer_domain_ = domain;
+    d.border_ = border;
+
+    // Alignment of the rows: largest power of two dividing both the
+    // data address and the absolute pitch, capped to a sane value so
+    // it can safely feed back into allocate() (e.g. through clone()).
+    {
+      typedef unsigned long long ULL;
+      ULL bits = ULL(data);
+      if (pitch != 0)
+        bits |= ULL(pitch < 0 ? -(long long) pitch : (long long) pitch);
+      unsigned int al = 1;
+      while (al < 4096 && (bits % (al * 2)) == 0) al *= 2;
+      d.alignment_ = al;
+    }
+
+    // Addressable range. Rows are located at begin_ + r * pitch, so
+    // with a negative pitch increasing row indices move towards lower
+    // addresses. Rows span [-border, nrows - 1 + border] and columns
+    // span [-border, ncols - 1 + border]: [data_, data_end_) covers
+    // exactly domain_with_border(), whichever side of begin_ the rows
+    // grow towards.
+    long long nrows = 1;
+    for (int n = 0; n < N - 1; n++)
+      nrows *= domain.size(n);
+
+    long long first_row = -border;
+    long long last_row = nrows - 1 + border;
+    long long first_off = first_row * (long long) pitch;
+    long long last_off = last_row * (long long) pitch;
+    char* rows_lo = (char*) data + std::min(first_off, last_off);
+    char* rows_hi = (char*) data + std::max(first_off, last_off);
+
+    char* lo = rows_lo - border * (long long) sizeof(V);
+    char* hi = rows_hi + (long long) (domain.size(N - 1) - 1 + border) * sizeof(V) + sizeof(V);
+
+    d.data_ = (V*) lo;
+    d.data_end_ = (V*) hi;
+  }
+
+
   template <typename V, unsigned N>
   void imageNd<V, N>::index_rows()
   {
@@ -213,7 +246,7 @@ namespace vpp
 
       rows.push_back(this->address_of(p));
 
-      if (p == vint<N>::Zero())
+      if (p.template segment<N - 1>(0) == (vint<N - 1>::Zero()))
         ras = rows.size() - 1;
     }
 
@@ -223,7 +256,7 @@ namespace vpp
   template <typename V, unsigned N>
   int imageNd<V, N>::coords_to_offset(const vint<N>& p) const
   {
-    int row_idx = p[N-2];
+    int row_idx = (N >= 2) ? p[N - 2] : 0;
     int ds = 1;
     for (int i = N - 3; i >= 0; i--)
     {
@@ -238,12 +271,12 @@ namespace vpp
   imageNd<V, N>::operator()(const vint<N>& p)
   {
     assert(domain_with_border().has(p));
+    assert(address_of(p) >= (V*) ptr_->data_ and address_of(p) < ptr_->data_end_);
     if (N == 2)
       return (*this)[p[0]][p[1]];
     else
     {
       V* addr = (V*)((char*)ptr_->begin_ + coords_to_offset(p));
-      assert(addr < ptr_->data_end_);
       return *addr;
     }
   }
@@ -253,12 +286,12 @@ namespace vpp
   imageNd<V, N>::operator()(const vint<N>& p) const
   {
     assert(domain_with_border().has(p));
+    assert(address_of(p) >= (const V*) ptr_->data_ and address_of(p) < (const V*) ptr_->data_end_);
     if (N == 2)
       return (*this)[p[0]][p[1]];
     else
     {
-      const V* addr = (V*)((char*)ptr_->begin_ + coords_to_offset(p));
-      assert(addr < ptr_->data_end_);
+      const V* addr = (const V*)((const char*)ptr_->begin_ + coords_to_offset(p));
       return *addr;
     }
   }
@@ -330,12 +363,27 @@ namespace vpp
     res.ptr_->begin_ = address_of(d.p1());
     res.ptr_->domain_ = boxNd<N>(d.p1() - d.p1(), d.p2() - d.p1());
 
+    // Shift the row pointers to the first column of the subimage.
+    const int col_shift = d.p1()[N - 1] - this->domain().p1()[N - 1];
     for (auto& r_start : res.ptr_->rows_)
-      r_start += d.p1()[1] - this->domain().p1()[1];
+      r_start += col_shift;
+
+    // Shift the row array so that row 0 of the subimage points to the
+    // first row of d in the parent buffer. rows_ is indexed by the
+    // flattened coordinates of the first N-1 dimensions.
+    int row_shift = 0;
+    {
+      int ds = 1;
+      for (int i = N - 2; i >= 0; i--)
+      {
+        row_shift += ds * d.p1()[i];
+        ds *= this->domain_with_border().size(i);
+      }
+    }
 
     res.ptr_->rows_array_start_ = &res.ptr_->rows_.front() +
       (this->ptr_->rows_array_start_ - &(this->ptr_->rows_.front()))
-      + (d.p1()[0] - this->domain().p1()[0]);
+      + row_shift;
 
     return res;
   }
@@ -351,12 +399,24 @@ namespace vpp
     res.ptr_->begin_ = const_cast<V*>(address_of(d.p1()));
     res.ptr_->domain_ = boxNd<N>(d.p1() - d.p1(), d.p2() - d.p1());
 
+    // See subimage().
+    const int col_shift = d.p1()[N - 1] - this->domain().p1()[N - 1];
     for (auto& r_start : res.ptr_->rows_)
-      r_start += d.p1()[1] - this->domain().p1()[1];
+      r_start += col_shift;
+
+    int row_shift = 0;
+    {
+      int ds = 1;
+      for (int i = N - 2; i >= 0; i--)
+      {
+        row_shift += ds * d.p1()[i];
+        ds *= this->domain_with_border().size(i);
+      }
+    }
 
     res.ptr_->rows_array_start_ = &res.ptr_->rows_.front() +
       (this->ptr_->rows_array_start_ - &(this->ptr_->rows_.front()))
-      + (d.p1()[0] - this->domain().p1()[0]);
+      + row_shift;
 
     return res;
   }

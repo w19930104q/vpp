@@ -15,8 +15,17 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/..
 
 add_definitions(-std=c++14 -g)
 
+option(VPP_TESTS_ASAN "Build the tests with AddressSanitizer." OFF)
+if (VPP_TESTS_ASAN)
+  add_definitions(-fsanitize=address -fno-omit-frame-pointer)
+  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fsanitize=address")
+endif ()
+
 add_executable(imageNd imageNd.cc)
 add_test(imageNd imageNd)
+
+add_executable(imageNd_bounds imageNd_bounds.cc)
+add_test(imageNd_bounds imageNd_bounds)
 
 add_executable(image2d image2d.cc)
 add_test(image2d image2d)

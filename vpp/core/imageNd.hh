@@ -161,8 +161,17 @@ namespace vpp
     inline void swap(imageNd<V, N>& o) { o.ptr_.swap(ptr_); }
 
   protected:
+    // Internal allocation strategy: owns the buffer, computes the
+    // pitch, the border padding and the alignment, and reserves the
+    // border ring inside the allocation.
     template <typename... O>
     void allocate(const std::vector<int>& dims, const iod::sio<O...>& options);
+    // External stride adaptation: wraps a user-provided buffer without
+    // copying. The signed pitch, the start offset and the border are
+    // described by the caller; this only derives the addressable range
+    // ([data_, data_end_)) so bounds checks stay meaningful even with
+    // a negative pitch.
+    void adapt_external_data(const boxNd<N>& domain, V* data, int pitch, int border);
     void index_rows();
     std::shared_ptr<imageNd_data<V, N> > ptr_;
   };
